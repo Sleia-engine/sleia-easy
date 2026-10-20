@@ -69,16 +69,5 @@ Start the local service:
 python start.py serve
 ```
 
-The default bind address is `127.0.0.1:5000`.
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/health` | Service health check |
-| `POST` | `/api/slice` | Upload a model and Basic settings; starts an asynchronous slice job |
-| `GET` | `/api/jobs/<id>` | Job status and metadata |
-| `GET` | `/api/jobs/<id>/gcode` | Download generated G-code |
-| `POST` | `/api/gcode/save` | Copy G-code to a destination path (`job_id`, `destination`) |
 
-## Version control
-
-This directory is part of the Sleia repository. Generated artifacts under `data/` and `*.gcode` files are excluded by `.gitignore`. Changes in this project must not be applied to `web-version`.
