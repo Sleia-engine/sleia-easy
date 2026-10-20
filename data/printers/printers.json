@@ -1,0 +1,47 @@
+[
+    {
+        "vendor": "Creality",
+        "model": "Ender 3 V2",
+        "printableSpace": {
+            "x": 220,
+            "y": 220,
+            "z": 250
+        },
+        "maxPrintHeight": 250,
+        "nozzleDiameter": 0.4,
+        "extruderCount": 1,
+        "heatedBed": "yes",
+        "maxPrintSpeed": 60,
+        "verified": true
+    },
+    {
+        "vendor": "Prusa",
+        "model": "i3 MK3S+",
+        "printableSpace": {
+            "x": 250,
+            "y": 210,
+            "z": 210
+        },
+        "maxPrintHeight": 210,
+        "nozzleDiameter": 0.4,
+        "extruderCount": 1,
+        "heatedBed": "yes",
+        "maxPrintSpeed": 200,
+        "verified": true
+    },
+    {
+        "vendor": "Bambu Lab",
+        "model": "X1 Carbon",
+        "printableSpace": {
+            "x": 256,
+            "y": 256,
+            "z": 256
+        },
+        "maxPrintHeight": 256,
+        "nozzleDiameter": 0.4,
+        "extruderCount": 1,
+        "heatedBed": "yes",
+        "maxPrintSpeed": 500,
+        "verified": true
+    }
+]

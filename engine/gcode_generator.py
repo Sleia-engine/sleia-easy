@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+# ------------------------------------------------------------------
+# Copyright (c) 2026 Sleia Engine Development Team.
+# This file is distributed under the MIT License. See LICENSE.
+#
+# Sleia Easy v 1.0.1 - Thermoplastic Python Slicer
+#
+# File: gcode_generator.py
+# Description: turns sliced layers into printer G-code.
+# ------------------------------------------------------------------
+
+import math
+import logging
+from typing import List, Dict, Optional, TextIO, Any, Callable, Union, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+import time
+from datetime import datetime, timedelta, timezone
+import numpy as np
+from collections import defaultdict, deque
+import itertools
+import functools
+import statistics
+import random
+import copy
+import re
+import json
+
+from .slicer_core import InfillPattern, Point2D, Point3D, SlicedModel, PrintSettings, Layer
+from .perimeter_generator import PerimeterPath, PerimeterLayer
+from .infill_generator import InfillGenerator
+
+class GCodeCommand(Enum):
+    MOVE = "G1"
+    RAPID_MOVE = "G0"
+    ARC_CW = "G2"
+    ARC_CCW = "G3"
+    DWELL = "G4"
+    HOME = "G28"
+    SET_POSITION = "G92"
+    SET_TEMP = "M104"
+    SET_BED_TEMP = "M140"
+    WAIT_TEMP = "M109"
+    WAIT_BED_TEMP = "M190"
+    FAN_ON = "M106"
+    FAN_OFF = "M107"
+    EXTRUDE = "E"
+
+@dataclass
+class GCodeState:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    e: float = 0.0  # Extruder position
+    f: float = 0.0  # Feed rate
+    temp: float = 0.0
+    bed_temp: float = 0.0
+    fan_speed: int = 0
+    absolute_extrusion: bool = True
+    retracted: bool = False
+    retraction_distance: float = 0.0
+    prime_amount: float = 0.0
+    relative_mode: bool = False
+
+@dataclass
+
+
+@dataclass
+class PathSegment:
+    start: Point3D
+    end: Point3D
+    extrusion_width: float
+    speed: float
+    layer_height: float
+    is_travel: bool = False
+    is_retraction: bool = False
+
+
+class GCodeGenerator:
+    
+    def __init__(self, settings: PrintSettings):
+        self.settings = settings
+        self.state = GCodeState()
+        self.commands: List[str] = []
+
+        # G-code generation parameters
+        self.retraction_threshold = self.settings.retract_before_travel
+        self.z_hop_height = 0.2  # mm
+        self.enable_z_hop = True
+        self.wipe_distance = 2.0  # mm
+        self.enable_wipe = True
+
+        # Statistics
+        self.total_extrusion = 0.0
+        self.total_travel_distance = 0.0
+        self.print_time_estimate = 0.0
+        self.layer_count = 0
+        self.current_layer_index = 0
+        self.infill_segment_count = 0
+        self.wall_segment_count = 0
+    
+    def generate_gcode(self, sliced_model: SlicedModel, 
+                      output_file: Optional[str] = None) -> str:
+        print("Generating G-code...")
+        
+        self.commands.clear()
+        self.state = GCodeState()
+        self.layer_count = len(sliced_model.layers)
+        self.current_layer_index = 0
+        self.infill_segment_count = 0
+        self.wall_segment_count = 0
+        
+        self._generate_header(sliced_model)
+        self._generate_start_gcode()
+        self._generate_adhesion_gcode(sliced_model)
+
+        infill_generator = InfillGenerator(self.settings)
+        
+        for layer_idx, layer in enumerate(sliced_model.layers):
+            print(f"Processing layer {layer_idx + 1}/{self.layer_count}")
+            self.current_layer_index = layer_idx
+            
+            self._generate_layer_gcode(layer, layer_idx, infill_generator)
+            
+            # Update progress
+            if layer_idx % 10 == 0:
+                progress = (layer_idx + 1) / self.layer_count * 100
+                self.add_comment(f"Layer {layer_idx + 1}/{self.layer_count} - {progress:.1f}%")
+        
+        # Generate end G-code
+        self._generate_end_gcode()
+        
+        # Generate footer with statistics
+        self._generate_footer(sliced_model)
+        
+        # Combine all commands
+        gcode_content = '\n'.join(self.commands)
+        
+        # Save to file if specified
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(gcode_content)
+            print(f"G-code saved to: {output_file}")
+        
+        print("G-code generation complete")
+        return gcode_content
+    
+    def _generate_header(self, sliced_model: SlicedModel):
+        now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        density = getattr(self.settings, "filament_density", 1.24)
+        diameter = getattr(self.settings, "filament_diameter", 1.75)
+        bed = getattr(self.settings, "bed_size", (220.0, 220.0))
+        max_z = 0.0
+        if sliced_model.layers:
+            max_z = max(layer.z_height for layer in sliced_model.layers)
+        self.add_comment("HEADER_BLOCK_START")
+        self.add_comment(f"generated by Sleia 3D Slicer on {now}")
+        self.add_comment(f"total layer number: {len(sliced_model.layers)}")
+        self.add_comment(f"filament_density: {density}")
+        self.add_comment(f"filament_diameter: {diameter}")
+        self.add_comment(f"max_z_height: {max_z:.2f}")
+        self.add_comment(f"bed_size: {bed[0]:.0f}x{bed[1]:.0f}")
+        self.add_comment("bed_origin: corner")
+        self.add_comment("HEADER_BLOCK_END")
+        self.add_comment("")
+        default_width = getattr(self.settings, "default_line_width", 0.42)
+        outer_width = getattr(self.settings, "outer_wall_line_width", default_width)
+        inner_width = getattr(self.settings, "inner_wall_line_width", default_width)
+        infill_width = getattr(self.settings, "sparse_infill_line_width", default_width)
+        first_width = getattr(self.settings, "first_layer_line_width", default_width)
+        self.add_comment(f"external perimeters extrusion width = {outer_width:.2f}mm")
+        self.add_comment(f"perimeters extrusion width = {inner_width:.2f}mm")
+        self.add_comment(f"infill extrusion width = {infill_width:.2f}mm")
+        self.add_comment(f"first layer extrusion width = {first_width:.2f}mm")
+        self.add_comment("")
+        self.add_comment("EXECUTABLE_BLOCK_START")
+        self.add_command("M201 X2000 Y2000 Z800 E2000")
+        self.add_command("M203 X300 Y300 Z8 E100")
+        self.add_command("M204 P2000 R2000 T2000")
+        self.add_command("M205 X10.00 Y10.00 Z2.00 E5.00 ; sets the jerk limits, mm/sec")
+
+    def _generate_start_gcode(self):
+        custom = (getattr(self.settings, "start_gcode", "") or "").strip()
+        if custom:
+            self.add_comment("TYPE:Custom")
+            for line in custom.splitlines():
+                self.add_command(line)
+            self.state.absolute_extrusion = True
+            return
+
+        nozzle = getattr(self.settings, "first_layer_nozzle_temp", self.settings.nozzle_temperature)
+        bed = getattr(self.settings, "first_layer_bed_temp", self.settings.bed_temperature)
+        self.add_comment("TYPE:Custom")
+        self.add_command("G90 ; use absolute coordinates")
+        self.add_command("M83 ; extruder relative mode")
+        if nozzle > 0:
+            self.add_command(f"M104 S{int(nozzle)} ; set extruder temp")
+        if bed > 0:
+            self.add_command(f"M140 S{int(bed)} ; set bed temp")
+            self.add_command(f"M190 S{int(bed)} ; wait for bed temp")
+        if nozzle > 0:
+            self.add_command(f"M109 S{int(nozzle)} ; wait for extruder temp")
+        self.add_command("G28 ; home")
+        self.add_command("G1 Z0.28 F3000 ; lift nozzle")
+        self.add_command("G92 E0")
+        self.add_command("G1 Y3 F1800")
+        self.add_command("G1 X60 E25 F500 ; prime line")
+        self.add_command("G92 E0")
+        self.add_command("G1 E-2 F500 ; retract after prime")
+        self.add_command("G1 X70 F4000 ; wipe")
+        self.add_command("G90")
+        self.add_command("G21")
+        self.add_command("M82 ; use absolute distances for extrusion")
+        self.add_command("G92 E0")
+        self.state.absolute_extrusion = True
+        self.state.e = 0
+        self.state.retracted = True
+        self.state.x = 70.0
+        self.state.y = 3.0
+        self.state.z = 0.28
+        self.add_comment("filament start gcode")
+        self.add_command("M106 S0")
+        self.add_comment("")
+
+    def _generate_adhesion_gcode(self, sliced_model: SlicedModel):
+        paths = getattr(sliced_model, "adhesion_paths", None) or []
+        if not paths:
+            return
+        self.add_comment("Adhesion (skirt/brim/raft)")
+        first_speed = self.settings.first_layer_speed
+        skirt_speed = getattr(self.settings, "skirt_speed", first_speed)
+        last_feature = ""
+        for path in paths:
+            kind = str(path.get("type") or "skirt")
+            z = float(path.get("z", self.settings.first_layer_height))
+            speed = float(path.get("speed") or (skirt_speed if kind == "skirt" else first_speed))
+            label = {"brim": "Brim", "raft": "Raft"}.get(kind, "Skirt")
+            if last_feature != label:
+                self.add_comment(f"TYPE:{label}")
+                last_feature = label
+            points = path.get("points")
+            if points and len(points) >= 2:
+                sx, sy = points[0][0], points[0][1]
+                self.move_to(sx, sy, z, self.settings.travel_speed, travel=True)
+                for px, py in points[1:]:
+                    dist = math.hypot(px - self.state.x, py - self.state.y)
+                    height = self.settings.first_layer_height if kind != "raft" else self.settings.layer_height
+                    extrusion = self._calculate_extrusion_amount(dist, self.settings.extrusion_width, height)
+                    self.move_to(px, py, z, speed, extrusion=extrusion)
+                continue
+            start = path.get("start")
+            end = path.get("end")
+            if start and end:
+                self.move_to(start[0], start[1], z, self.settings.travel_speed, travel=True)
+                dist = math.hypot(end[0] - start[0], end[1] - start[1])
+                extrusion = self._calculate_extrusion_amount(dist, self.settings.extrusion_width, self.settings.first_layer_height)
+                self.move_to(end[0], end[1], z, speed, extrusion=extrusion)
+        self.add_comment("")
+    
+    def _generate_layer_gcode(self, layer: Layer, layer_idx: int, 
+                            infill_generator: InfillGenerator):
+        self._layer_time_start = self.print_time_estimate * 60.0
+        layer_h = self.settings.first_layer_height if layer_idx == 0 else self.settings.layer_height
+        self.add_comment("LAYER_CHANGE")
+        self.add_comment(f"Z:{layer.z_height:.2f}")
+        self.add_comment(f"HEIGHT:{layer_h:.2f}")
+        self.add_comment(f" BEFORE_LAYER_CHANGE {layer_idx} @ {layer.z_height:.2f}mm")
+        before_layer = (getattr(self.settings, "before_layer_change_gcode", "") or "").strip()
+        if before_layer:
+            for line in before_layer.splitlines():
+                self.add_command(line)
+
+        if layer_idx == 1:
+            if self.settings.nozzle_temperature != self.settings.first_layer_nozzle_temp:
+                self.add_command(f"M104 S{int(self.settings.nozzle_temperature)}")
+                self.state.temp = self.settings.nozzle_temperature
+            if self.settings.bed_temperature != self.settings.first_layer_bed_temp:
+                self.add_command(f"M140 S{int(self.settings.bed_temperature)}")
+                self.state.bed_temp = self.settings.bed_temperature
+            fan = float(getattr(self.settings, "fan_default_speed", 0) or 0)
+            if getattr(self.settings, "fan_enabled", False) and fan > 0:
+                pwm = int(255 * fan / 100.0)
+                self.add_command(f"M106 S{pwm}")
+                self.state.fan_speed = pwm
+
+        if layer_idx > 0:
+            self.move_to(self.state.x, self.state.y, layer.z_height,
+                        self.settings.travel_speed, travel=True)
+
+        self.add_comment(f" AFTER_LAYER_CHANGE {layer_idx} @ {layer.z_height:.2f}mm")
+        layer_change = (getattr(self.settings, "layer_change_gcode", "") or "").strip()
+        if layer_change:
+            for line in layer_change.splitlines():
+                self.add_command(line)
+
+        if layer.support_polygons:
+            self.add_comment("TYPE:Support")
+            self._generate_support_gcode(layer.support_polygons, layer.z_height)
+
+        total_layers = self.layer_count
+        bottom_layers = int(getattr(self.settings, "bottom_shell_layers", 0) or 0)
+        top_layers = int(getattr(self.settings, "top_shell_layers", 0) or 0)
+        surface = str(getattr(self.settings, "ironing_surface", "top") or "top").lower()
+        for poly_idx, polygon in enumerate(layer.polygons):
+            self.add_comment("TYPE:Outer wall")
+            from .perimeter_generator import PerimeterGenerator
+            perimeter_gen = PerimeterGenerator(self.settings)
+            perimeter_layer = perimeter_gen.generate_perimeters(
+                polygon, layer.z_height, enable_advanced=False
+            )
+            self._generate_perimeter_gcode(perimeter_layer, layer.z_height)
+
+            is_bottom_solid = layer_idx < bottom_layers
+            is_top_solid = layer_idx >= max(0, total_layers - top_layers)
+            solid = is_bottom_solid or is_top_solid
+            old_density = self.settings.fill_density
+            old_pattern = self.settings.fill_pattern
+            if solid:
+                self.settings.fill_density = 1.0
+                pattern_name = (
+                    getattr(self.settings, "bottom_surface_pattern", "rectilinear")
+                    if is_bottom_solid and not is_top_solid
+                    else getattr(self.settings, "top_surface_pattern", "concentric")
+                )
+                self.settings.fill_pattern = self._surface_pattern(pattern_name)
+            if self.settings.fill_density > 0:
+                infill_lines = infill_generator.generate_infill(polygon, layer.z_height)
+                if infill_lines:
+                    self.add_comment("TYPE:Top surface" if solid else "TYPE:Sparse infill")
+                    self._generate_infill_gcode(infill_lines, layer.z_height)
+            self.settings.fill_density = old_density
+            self.settings.fill_pattern = old_pattern
+            if self.settings.enable_ironing and (
+                surface in {"all_solid", "all-solid"} and solid
+                or surface in {"top", "all_top_solid", "all-top-solid"} and is_top_solid
+            ):
+                self._generate_ironing_gcode(polygon, layer.z_height)
+
+        self.add_command("")
+        self._generate_layer_end(layer_idx)
+
+    def _surface_pattern(self, name: str) -> InfillPattern:
+        key = str(name or "rectilinear").lower().replace("-", "_")
+        aliases = {
+            "rectilinear": InfillPattern.RECTILINEAR,
+            "concentric": InfillPattern.CONCENTRIC,
+            "monotonic": InfillPattern.MONOTONIC,
+            "hilbert": InfillPattern.HILBERT_CURVE,
+            "hilbert_curve": InfillPattern.HILBERT_CURVE,
+            "archimedean": InfillPattern.ARCHIMEDEAN_CHORDS,
+            "archimedean_chords": InfillPattern.ARCHIMEDEAN_CHORDS,
+            "octagram": InfillPattern.OCTAGRAM_SPIRAL,
+            "octagram_spiral": InfillPattern.OCTAGRAM_SPIRAL,
+        }
+        return aliases.get(key, InfillPattern.RECTILINEAR)
+
+    def _generate_ironing_gcode(self, polygon, layer_height: float) -> None:
+        points = getattr(polygon, "points", None) or []
+        if len(points) < 3:
+            return
+        min_x = min(point.x for point in points)
+        max_x = max(point.x for point in points)
+        min_y = min(point.y for point in points)
+        max_y = max(point.y for point in points)
+        spacing = max(0.2, float(self.settings.extrusion_width) * 0.8)
+        flow = max(0.0, float(getattr(self.settings, "ironing_flow", 10.0)) / 100.0)
+        speed = float(getattr(self.settings, "ironing_speed", 20.0))
+        self.add_comment("Ironing")
+        y = min_y
+        reverse = False
+        while y <= max_y + 1e-6:
+            start_x, end_x = (max_x, min_x) if reverse else (min_x, max_x)
+            self.move_to(start_x, y, layer_height, self.settings.travel_speed, travel=True)
+            distance = abs(end_x - start_x)
+            extrusion = self._calculate_extrusion_amount(
+                distance, self.settings.extrusion_width, layer_height
+            ) * flow
+            self.move_to(end_x, y, layer_height, speed, extrusion=extrusion)
+            y += spacing
+            reverse = not reverse
+
+    def _generate_layer_end(self, layer_idx: int) -> None:
+        if layer_idx == 0 and self.settings.nozzle_temperature > 0:
+            self.add_command(f"M104 S{int(self.settings.nozzle_temperature)}")
+            self.state.temp = self.settings.nozzle_temperature
+        if layer_idx >= 1 and getattr(self.settings, "fan_enabled", False):
+            fan_pct = max(0.0, min(100.0, float(getattr(self.settings, "fan_speed", 100.0))))
+            fan_pwm = int(round(fan_pct * 255.0 / 100.0))
+            if fan_pwm != self.state.fan_speed:
+                self.add_command(f"M106 S{fan_pwm}")
+                self.state.fan_speed = fan_pwm
+        elapsed = max(0.0, self.print_time_estimate * 60.0 - getattr(self, "_layer_time_start", 0.0))
+        minimum = float(getattr(self.settings, "min_layer_time", 0.0) or 0.0)
+        if getattr(self.settings, "slow_down_layers", True) and minimum > elapsed:
+            self.add_command(f"G4 P{int(round((minimum - elapsed) * 1000.0))}")
+        lapse = str(getattr(self.settings, "timelapse_type", "off") or "off").lower()
+        if lapse != "off":
+            self.add_comment(f"Timelapse: {lapse}")
+            if lapse in {"layer-change", "layer_change"}:
+                self.add_command("G4 P250 ; timelapse dwell")
+                self.add_command('M118 P0 S"timelapse" ; trigger timelapse')
+            elif lapse == "event-triggered":
+                self.add_command('M118 P0 S"timelapse" ; trigger timelapse')
+    
+    def _generate_support_gcode(self, support_polygons: List, layer_height: float):
+        support_speed = self.settings.infill_speed * 0.8  # Slower for support
+        
+        for support_polygon in support_polygons:
+            # Convert support polygon to simple outline
+            if hasattr(support_polygon, 'points') and support_polygon.points:
+                # Move to start of support
+                start_point = support_polygon.points[0]
+                self.move_to(start_point.x, start_point.y, layer_height, 
+                           self.settings.travel_speed, travel=True)
+                
+                # Extrude support outline
+                for i in range(1, len(support_polygon.points)):
+                    point = support_polygon.points[i]
+                    distance = self._calculate_distance_2d(
+                        Point2D(self.state.x, self.state.y), point
+                    )
+                    extrusion = self._calculate_extrusion_amount(
+                        distance, 
+                        self.settings.extrusion_width, 
+                        layer_height
+                    )
+                    
+                    self.move_to(point.x, point.y, layer_height, 
+                               support_speed, extrusion=extrusion)
+                
+                # Close support polygon if needed
+                if len(support_polygon.points) > 2:
+                    start_point = support_polygon.points[0]
+                    distance = self._calculate_distance_2d(
+                        Point2D(self.state.x, self.state.y), start_point
+                    )
+                    extrusion = self._calculate_extrusion_amount(
+                        distance, 
+                        self.settings.extrusion_width, 
+                        layer_height
+                    )
+                    
+                    self.move_to(start_point.x, start_point.y, layer_height, 
+                               support_speed, extrusion=extrusion)
+    
+    def _generate_perimeter_gcode(self, perimeter_layer, layer_height: float):
+        if hasattr(perimeter_layer, "paths"):
+            paths = list(perimeter_layer.paths)
+        elif hasattr(perimeter_layer, "perimeters"):
+            paths = []
+            for item in perimeter_layer.perimeters:
+                paths.extend(getattr(item, "paths", [item]))
+        elif isinstance(perimeter_layer, list):
+            paths = []
+            for item in perimeter_layer:
+                paths.extend(getattr(item, "paths", [item]))
+        else:
+            return
+
+        order = str(getattr(self.settings, "order_of_walls", "inner-outer") or "inner-outer")
+        def is_external(item) -> bool:
+            perimeter_type = getattr(item, "perimeter_type", None)
+            return getattr(perimeter_type, "value", "") == "external"
+        if order.startswith("outer"):
+            paths.sort(key=lambda item: 0 if is_external(item) else 1)
+        else:
+            paths.sort(key=lambda item: 0 if not is_external(item) else 1)
+
+        speed = (
+            self.settings.first_layer_speed
+            if self.current_layer_index == 0
+            else self.settings.perimeter_speed
+        )
+        for path in paths:
+            if hasattr(path, "points"):
+                self._generate_path_gcode(path, layer_height, speed)
+    
+    def _generate_infill_gcode(self, infill_lines: List, layer_height: float):
+        speed = self.settings.infill_speed
+        for line in infill_lines or []:
+            points = self._infill_line_points(line)
+            if len(points) < 2:
+                continue
+            start = points[0]
+            self.move_to(start.x, start.y, layer_height, self.settings.travel_speed, travel=True)
+            for point in points[1:]:
+                distance = self._calculate_distance_2d(
+                    Point2D(self.state.x, self.state.y), point
+                )
+                extrusion = self._calculate_extrusion_amount(
+                    distance, self.settings.extrusion_width, layer_height
+                )
+                self.move_to(point.x, point.y, layer_height, speed, extrusion=extrusion)
+                self.infill_segment_count += 1
+
+    def _infill_line_points(self, line) -> List[Point2D]:
+        if line is None:
+            return []
+        if hasattr(line, "start") and hasattr(line, "end"):
+            return [line.start, line.end]
+        if hasattr(line, "points") and line.points:
+            return list(line.points)
+        if isinstance(line, (list, tuple)):
+            if len(line) >= 2 and all(hasattr(p, "x") and hasattr(p, "y") for p in line):
+                return list(line)
+            points = []
+            for item in line:
+                points.extend(self._infill_line_points(item))
+            return points
+        return []
+    
+    def _generate_path_gcode(self, path, layer_height: float, speed: float):
+        if hasattr(path, 'points') and path.points:
+            points = list(path.points)
+            if len(points) >= 3:
+                seam = str(getattr(self.settings, "seam_position", "aligned") or "aligned").lower()
+                is_inner = getattr(getattr(path, "perimeter_type", None), "value", "") != "external"
+                if seam == "nearest":
+                    start_index = min(
+                        range(len(points)),
+                        key=lambda i: math.hypot(points[i].x - self.state.x, points[i].y - self.state.y),
+                    )
+                elif seam == "back":
+                    start_index = min(range(len(points)), key=lambda i: points[i].y)
+                elif seam == "random":
+                    start_index = (self.current_layer_index * 37 + len(points)) % len(points)
+                else:
+                    start_index = 0
+                if is_inner and getattr(self.settings, "staggered_inner_seams", False):
+                    start_index = (start_index + self.current_layer_index * max(1, len(points) // 8)) % len(points)
+                points = points[start_index:] + points[:start_index]
+
+            start_point = points[0]
+            self.move_to(start_point.x, start_point.y, layer_height, 
+                       self.settings.travel_speed, travel=True)
+            
+            if len(points) < 2:
+                return
+            closed = points[-1].distance(points[0]) < 1e-6
+            segments = list(zip(points[:-1], points[1:]))
+            if not closed:
+                segments.append((points[-1], points[0]))
+            loop_length = sum(a.distance(b) for a, b in segments)
+            gap_pct = max(0.0, min(50.0, float(getattr(self.settings, "seam_gap", 0.0) or 0.0)))
+            remaining = max(0.0, loop_length - min(loop_length * gap_pct / 100.0, max(0.2, self.settings.extrusion_width * 4.0)))
+            printed = 0.0
+            for start, point in segments:
+                if printed >= remaining - 1e-6:
+                    break
+                distance = start.distance(point)
+                if distance <= 1e-9:
+                    continue
+                if printed + distance > remaining:
+                    ratio = (remaining - printed) / distance
+                    point = Point2D(
+                        start.x + (point.x - start.x) * ratio,
+                        start.y + (point.y - start.y) * ratio,
+                    )
+                    distance = start.distance(point)
+                extrusion = self._calculate_extrusion_amount(
+                    distance, self.settings.extrusion_width, layer_height
+                )
+                
+                self.move_to(point.x, point.y, layer_height, speed, extrusion=extrusion)
+                self.wall_segment_count += 1
+                printed += distance
+            if getattr(self.settings, "wipe_on_loops", False):
+                self.add_comment("  Seam wipe")
+                wipe_distance = min(2.0, max(0.4, float(getattr(self.settings, "wipe_distance", 1.0) or 1.0)))
+                if len(points) >= 2:
+                    a, b = points[0], points[1]
+                    length = a.distance(b)
+                    if length > 1e-9:
+                        ratio = min(1.0, wipe_distance / length)
+                        self.move_to(
+                            a.x + (b.x - a.x) * ratio,
+                            a.y + (b.y - a.y) * ratio,
+                            layer_height,
+                            max(5.0, speed * float(getattr(self.settings, "wipe_speed", 80.0)) / 100.0),
+                            travel=True,
+                        )
+    
+    def _generate_end_gcode(self):
+        custom = (getattr(self.settings, "end_gcode", "") or "").strip()
+        if custom:
+            self.add_comment("TYPE:Custom")
+            for line in custom.splitlines():
+                self.add_command(line)
+            self.add_comment("EXECUTABLE_BLOCK_END")
+            self.add_comment("")
+            return
+        self.add_comment("TYPE:Custom")
+        self.add_comment("filament end gcode")
+        if not self.state.retracted:
+            self.retract()
+        self.add_command("M104 S0 ; Extruder off")
+        self.add_command("M140 S0 ; Heatbed off")
+        self.add_command("M107 ; Fan off")
+        self.add_command("G91 ; relative positioning")
+        self.add_command("G1 E-5 F3000")
+        self.add_command("G1 Z+0.3 F3000 ; lift print head")
+        self.add_command("G28 X0 F3000")
+        self.add_command("M84")
+        self.add_command("G90")
+        self.add_comment("EXECUTABLE_BLOCK_END")
+        self.add_comment("")
+
+    def _generate_footer(self, sliced_model):
+        density = getattr(self.settings, "filament_density", 1.24)
+        diameter = getattr(self.settings, "filament_diameter", 1.75)
+        filament_mm = self.state.e or self.total_extrusion
+        filament_m = filament_mm / 1000.0
+        radius = diameter / 2.0
+        grams = (math.pi * radius * radius * filament_mm * density) / 1000.0
+        total_s = max(1.0, self.print_time_estimate * 60.0)
+        hours = int(total_s // 3600)
+        minutes = int((total_s % 3600) // 60)
+        secs = int(total_s % 60)
+        if hours > 0:
+            time_s = f"{hours}h {minutes}m {secs}s"
+        elif minutes > 0:
+            time_s = f"{minutes}m {secs}s"
+        else:
+            time_s = f"{secs}s"
+        self.add_comment("statistics = begin")
+        self.add_comment(f"used_filament = {filament_m:.2f}")
+        self.add_comment(f"print_time = {time_s}")
+        self.add_comment(f"total_layers = {self.layer_count}")
+        self.add_comment(f"filament_grams = {grams:.2f}")
+        self.add_comment("statistics = end")
+        self.add_comment("")
+        self.add_comment("Generated by Sleia Web Slicer")
+    
+    def move_to(self, x: float, y: float, z: float, speed: float, 
+               extrusion: Optional[float] = None, travel: bool = False):
+        
+        # Handle retraction for travel moves
+        if travel and not self.state.retracted:
+            if self._should_retract(x, y):
+                self.retract()
+        
+        # Calculate movement
+        distance = math.sqrt(
+            (x - self.state.x)**2 + 
+            (y - self.state.y)**2 + 
+            (z - self.state.z)**2
+        )
+        
+        # Build G-code command
+        if travel:
+            command = "G0"  # Rapid move
+            self.total_travel_distance += distance
+        else:
+            command = "G1"  # Linear move
+        
+        # Add coordinates
+        parts = [command]
+        
+        if abs(x - self.state.x) > 0.001:
+            parts.append(f"X{x:.3f}")
+        if abs(y - self.state.y) > 0.001:
+            parts.append(f"Y{y:.3f}")
+        if abs(z - self.state.z) > 0.001:
+            parts.append(f"Z{z:.3f}")
+        
+        # Add extrusion
+        if extrusion is not None and extrusion > 0:
+            new_e = self.state.e + extrusion
+            parts.append(f"E{new_e:.5f}")
+            self.total_extrusion += extrusion
+            self._update_position(x, y, z, new_e)
+            
+            # Unretract if needed
+            if self.state.retracted:
+                self.state.retracted = False
+        else:
+            self._update_position(x, y, z, self.state.e)
+        
+        # Add feed rate
+        if speed != self.state.f:
+            parts.append(f"F{speed * 60:.0f}")  # Convert mm/s to mm/min
+            self.state.f = speed
+        
+        self.add_command(" ".join(parts))
+        
+        # Update print time estimate
+        if speed > 0:
+            self.print_time_estimate += distance / speed / 60  # minutes
+    
+    def retract(self):
+        if not self.state.retracted:
+            retract_amount = getattr(self.settings, 'retract_length', 1.0)
+            new_e = self.state.e - retract_amount
+            self.add_command(f"G1 E{new_e:.5f} F{self.settings.retract_speed * 60:.0f}")
+            self.state.e = new_e
+            self.state.retracted = True
+    
+    def _should_retract(self, target_x: float, target_y: float) -> bool:
+        distance = math.sqrt(
+            (target_x - self.state.x)**2 + (target_y - self.state.y)**2
+        )
+        return distance > self.retraction_threshold
+    
+    def _calculate_extrusion_amount(self, distance: float, width: float, height: float) -> float:
+        # Volume = cross-sectional area × distance
+        # Assuming rectangular cross-section approximation
+        area = width * height
+        volume = area * distance
+        
+        # Convert volume to linear extrusion
+        filament_diameter = getattr(self.settings, 'filament_diameter', 1.75)
+        filament_area = math.pi * (filament_diameter / 2)**2
+        
+        return volume / filament_area
+    
+    def _calculate_distance_2d(self, p1: Point2D, p2: Point2D) -> float:
+        return math.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2)
+    
+    def _update_position(self, x: float, y: float, z: float, e: float):
+        self.state.x = x
+        self.state.y = y
+        self.state.z = z
+        self.state.e = e
+    
+    def add_command(self, command: str):
+        self.commands.append(command)
+    
+    def add_comment(self, comment: str):
+        self.commands.append(f"; {comment}")
+
+    def get_statistics(self) -> Dict:
+        return {
+            'infill_segments': self.infill_segment_count,
+            'wall_segments': self.wall_segment_count,
+            'total_extrusion': self.total_extrusion,
+            'total_travel_distance': self.total_travel_distance,
+            'estimated_time': self.print_time_estimate,
+            'material_usage': self._estimate_material_usage(),
+            'command_count': len(self.commands)
+        }
+
+    def _estimate_material_usage(self) -> float:
+        filament_diameter = getattr(self.settings, 'filament_diameter', 1.75)
+        filament_area = math.pi * (filament_diameter / 2) ** 2
+        volume_mm3 = self.total_extrusion * filament_area
+        volume_cm3 = volume_mm3 / 1000
+        material_grams = volume_cm3 * getattr(self.settings, "filament_density", 1.24)
+        return material_grams
+
+
+# Example usage

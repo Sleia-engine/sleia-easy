@@ -1,0 +1,70 @@
+[
+    {
+        "name": "PLA",
+        "type": "pla",
+        "diameter": 1.75,
+        "density": 1.24,
+        "costPerGram": 0.02,
+        "temperatures": {
+            "nozzle": {
+                "min": 190,
+                "max": 220
+            },
+            "bed": {
+                "firstLayer": 60,
+                "otherLayers": 55
+            }
+        }
+    },
+    {
+        "name": "ABS",
+        "type": "abs",
+        "diameter": 1.75,
+        "density": 1.04,
+        "costPerGram": 0.025,
+        "temperatures": {
+            "nozzle": {
+                "min": 230,
+                "max": 250
+            },
+            "bed": {
+                "firstLayer": 100,
+                "otherLayers": 90
+            }
+        }
+    },
+    {
+        "name": "PETG",
+        "type": "petg",
+        "diameter": 1.75,
+        "density": 1.27,
+        "costPerGram": 0.03,
+        "temperatures": {
+            "nozzle": {
+                "min": 230,
+                "max": 250
+            },
+            "bed": {
+                "firstLayer": 80,
+                "otherLayers": 75
+            }
+        }
+    },
+    {
+        "name": "TPU",
+        "type": "tpu",
+        "diameter": 1.75,
+        "density": 1.21,
+        "costPerGram": 0.035,
+        "temperatures": {
+            "nozzle": {
+                "min": 200,
+                "max": 230
+            },
+            "bed": {
+                "firstLayer": 50,
+                "otherLayers": 50
+            }
+        }
+    }
+]
